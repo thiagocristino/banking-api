@@ -66,6 +66,7 @@ builder.Services.AddDbContext<BankingDbContext>(options =>
 // Services
 builder.Services.AddScoped<AccountService>();
 builder.Services.AddScoped<TransferService>();
+builder.Services.AddScoped<ReversalService>();
 builder.Services.AddScoped<AuthService>();
 
 var app = builder.Build();

@@ -53,10 +53,11 @@ public class AccountsController : ControllerBase
 
         return Ok(result);
     }
+
     [Authorize]
     [HttpPost("me/deposit")]
     public async Task<ActionResult<DepositResponse>> Deposit(
-    DepositRequest request)
+        DepositRequest request)
     {
         var accountIdClaim = User.FindFirstValue("account_id");
 
@@ -85,6 +86,54 @@ public class AccountsController : ControllerBase
             accountId,
             request,
             idempotencyKey.ToString());
+
+        return Ok(result);
+    }
+
+    [Authorize]
+    [HttpGet("me/statement")]
+    public async Task<ActionResult<StatementResponse>> Statement(
+        [FromQuery] DateTime? startDate,
+        [FromQuery] DateTime? endDate,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 50)
+    {
+        var accountIdClaim = User.FindFirstValue("account_id");
+
+        if (string.IsNullOrEmpty(accountIdClaim))
+        {
+            return Unauthorized();
+        }
+
+        if (!Guid.TryParse(accountIdClaim, out var accountId))
+        {
+            return Unauthorized();
+        }
+
+        if (page < 1)
+        {
+            return BadRequest(new
+            {
+                code = "INVALID_PAGE",
+                message = "Page must be greater than or equal to 1."
+            });
+        }
+
+        if (pageSize < 1 || pageSize > 100)
+        {
+            return BadRequest(new
+            {
+                code = "INVALID_PAGE_SIZE",
+                message = "PageSize must be between 1 and 100."
+            });
+        }
+
+        var result = await _accountService.GetStatementAsync(
+            accountId,
+            startDate,
+            endDate,
+            page,
+            pageSize);
 
         return Ok(result);
     }

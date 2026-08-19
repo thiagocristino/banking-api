@@ -59,7 +59,6 @@ public class BankingDbContext : DbContext
             entity.Property(x => x.Version)
                 .IsConcurrencyToken()
                 .IsRequired();
-
         });
 
         modelBuilder.Entity<Transfer>(entity =>
@@ -76,11 +75,26 @@ public class BankingDbContext : DbContext
             entity.Property(x => x.CreatedAt)
                 .IsRequired();
 
+            entity.Property(x => x.ReversedAt)
+                .IsRequired(false);
+
             entity.HasIndex(x => x.SourceAccountId);
 
             entity.HasIndex(x => x.DestinationAccountId);
 
             entity.HasIndex(x => x.CreatedAt);
+
+            entity.HasIndex(x => new
+            {
+                x.SourceAccountId,
+                x.CreatedAt
+            });
+
+            entity.HasIndex(x => new
+            {
+                x.DestinationAccountId,
+                x.CreatedAt
+            });
         });
 
         modelBuilder.Entity<LedgerEntry>(entity =>
@@ -160,6 +174,5 @@ public class BankingDbContext : DbContext
             .WithMany()
             .HasForeignKey(x => x.DestinationAccountId)
             .OnDelete(DeleteBehavior.Restrict);
-
     }
 }

@@ -1,4 +1,7 @@
-﻿using System.Text.Json;
+﻿using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using BankingApi.Data;
 using BankingApi.Domain;
 using BankingApi.DTOs;
@@ -86,7 +89,6 @@ public class AccountService
         DepositRequest request,
         string idempotencyKey)
     {
-        // 1. Validar Idempotency-Key
         if (string.IsNullOrWhiteSpace(idempotencyKey))
         {
             throw new BusinessException(
@@ -95,7 +97,6 @@ public class AccountService
                 400);
         }
 
-        // 2. Validar valor
         if (request.Amount <= 0)
         {
             throw new BusinessException(
@@ -104,18 +105,15 @@ public class AccountService
                 400);
         }
 
-        // 3. Gerar hash da requisição
         var requestHash = Convert.ToHexString(
-            System.Security.Cryptography.SHA256.HashData(
-                System.Text.Encoding.UTF8.GetBytes(
+            SHA256.HashData(
+                Encoding.UTF8.GetBytes(
                     request.Amount.ToString(
-                        System.Globalization.CultureInfo.InvariantCulture))));
+                        CultureInfo.InvariantCulture))));
 
-        // 4. Iniciar transação
         await using var transaction =
             await _db.Database.BeginTransactionAsync();
 
-        // 5. Verificar idempotência
         var existingRequest =
             await _db.IdempotencyRequests
                 .FirstOrDefaultAsync(x =>
@@ -126,6 +124,8 @@ public class AccountService
         {
             if (existingRequest.RequestHash != requestHash)
             {
+                await transaction.RollbackAsync();
+
                 throw new BusinessException(
                     "IDEMPOTENCY_KEY_REUSED",
                     "The Idempotency-Key was already used with a different request.",
@@ -138,6 +138,8 @@ public class AccountService
 
             if (previousResponse is null)
             {
+                await transaction.RollbackAsync();
+
                 throw new BusinessException(
                     "IDEMPOTENCY_RESPONSE_INVALID",
                     "The stored idempotency response is invalid.",
@@ -149,26 +151,24 @@ public class AccountService
             return previousResponse;
         }
 
-        // 6. Buscar conta
         var account = await _db.Accounts
             .FirstOrDefaultAsync(x =>
                 x.Id == accountId);
 
         if (account is null)
         {
+            await transaction.RollbackAsync();
+
             throw new BusinessException(
                 "ACCOUNT_NOT_FOUND",
                 "Account was not found.",
                 404);
         }
 
-        // 7. Atualizar saldo
         account.Balance += request.Amount;
 
-        // 8. Atualizar versão para controle de concorrência
         account.Version++;
 
-        // 9. Criar lançamento no Ledger
         var ledgerEntry = new LedgerEntry
         {
             Id = Guid.NewGuid(),
@@ -188,7 +188,6 @@ public class AccountService
 
         _db.LedgerEntries.Add(ledgerEntry);
 
-        // 10. Criar resposta
         var response = new DepositResponse
         {
             AccountId = account.Id,
@@ -202,7 +201,6 @@ public class AccountService
             CreatedAtUtc = ledgerEntry.CreatedAtUtc
         };
 
-        // 11. Registrar idempotência
         var idempotencyRequest = new IdempotencyRequest
         {
             Id = Guid.NewGuid(),
@@ -224,25 +222,42 @@ public class AccountService
         _db.IdempotencyRequests.Add(
             idempotencyRequest);
 
-        // 12. Persistir tudo com controle de concorrência
         try
         {
             await _db.SaveChangesAsync();
 
-            // 13. Confirmar transação
             await transaction.CommitAsync();
         }
         catch (DbUpdateConcurrencyException)
         {
-            await transaction.RollbackAsync();
+            try
+            {
+                await transaction.RollbackAsync();
+            }
+            catch
+            {
+                // Transaction may already have been rolled back.
+            }
 
             throw new BusinessException(
                 "CONCURRENT_MODIFICATION",
                 "The account was modified by another transaction. Please retry.",
                 409);
         }
+        catch (DbUpdateException)
+        {
+            try
+            {
+                await transaction.RollbackAsync();
+            }
+            catch
+            {
+                // Transaction may already have been rolled back.
+            }
 
-        // 14. Retornar resposta
+            throw;
+        }
+
         return response;
     }
 
@@ -265,6 +280,134 @@ public class AccountService
             AccountNumber = account.AccountNumber,
             Name = account.Name,
             Email = account.Email
+        };
+    }
+
+    public async Task<StatementResponse> GetStatementAsync(
+        Guid accountId,
+        DateTime? startDate,
+        DateTime? endDate,
+        int page,
+        int pageSize)
+    {
+        if (page < 1)
+        {
+            page = 1;
+        }
+
+        if (pageSize < 1)
+        {
+            pageSize = 50;
+        }
+
+        if (pageSize > 100)
+        {
+            pageSize = 100;
+        }
+
+        var accountExists = await _db.Accounts
+            .AsNoTracking()
+            .AnyAsync(x => x.Id == accountId);
+
+        if (!accountExists)
+        {
+            throw new BusinessException(
+                "ACCOUNT_NOT_FOUND",
+                "Account was not found.",
+                404);
+        }
+
+        var start = startDate?.ToUniversalTime()
+            ?? DateTime.UnixEpoch;
+
+        var end = endDate?.ToUniversalTime()
+            ?? DateTime.UtcNow;
+
+        if (end <= start)
+        {
+            throw new BusinessException(
+                "INVALID_STATEMENT_PERIOD",
+                "The statement end date must be greater than the start date.",
+                400);
+        }
+
+        var entriesQuery = _db.LedgerEntries
+            .AsNoTracking()
+            .Where(x =>
+                x.AccountId == accountId &&
+                x.CreatedAtUtc >= start &&
+                x.CreatedAtUtc < end);
+
+        var totalEntries =
+            await entriesQuery.CountAsync();
+
+        var totalPages = (int)Math.Ceiling(
+            totalEntries / (double)pageSize);
+
+        var openingEntry = await _db.LedgerEntries
+            .AsNoTracking()
+            .Where(x =>
+                x.AccountId == accountId &&
+                x.CreatedAtUtc < start)
+            .OrderByDescending(x => x.CreatedAtUtc)
+            .ThenByDescending(x => x.Id)
+            .FirstOrDefaultAsync();
+
+        var openingBalance =
+            openingEntry?.BalanceAfter ?? 0m;
+
+        var entries = await entriesQuery
+            .OrderBy(x => x.CreatedAtUtc)
+            .ThenBy(x => x.Id)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .Select(x => new StatementEntryResponse
+            {
+                Id = x.Id,
+
+                Amount = x.Amount,
+
+                BalanceAfter = x.BalanceAfter,
+
+                Type = x.Type,
+
+                TransferId = x.TransferId,
+
+                CreatedAtUtc = x.CreatedAtUtc
+            })
+            .ToListAsync();
+
+        var closingEntry = await _db.LedgerEntries
+            .AsNoTracking()
+            .Where(x =>
+                x.AccountId == accountId &&
+                x.CreatedAtUtc < end)
+            .OrderByDescending(x => x.CreatedAtUtc)
+            .ThenByDescending(x => x.Id)
+            .FirstOrDefaultAsync();
+
+        var closingBalance =
+            closingEntry?.BalanceAfter ?? 0m;
+
+        return new StatementResponse
+        {
+            StartDate = start,
+
+            EndDate = end,
+
+            OpeningBalance = openingBalance,
+
+            ClosingBalance = closingBalance,
+
+            Page = page,
+
+            PageSize = pageSize,
+
+            TotalEntries = totalEntries,
+
+            TotalPages = totalPages,
+
+            Entries = entries
         };
     }
 }

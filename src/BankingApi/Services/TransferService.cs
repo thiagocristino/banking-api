@@ -1,14 +1,20 @@
-﻿using System.Text.Json;
+﻿using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using BankingApi.Data;
 using BankingApi.Domain;
 using BankingApi.DTOs;
 using BankingApi.Exceptions;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace BankingApi.Services;
 
 public class TransferService
 {
+    private const int MaxConcurrencyRetries = 10;
+
     private readonly BankingDbContext _db;
 
     public TransferService(BankingDbContext db)
@@ -52,20 +58,133 @@ public class TransferService
         var destinationAccountNumber =
             request.DestinationAccountNumber.Trim();
 
-        // 4. Gerar hash da requisição
+        // 4. Gerar hash determinístico do request.
+        //
+        // A chave de idempotência identifica a operação.
+        // O hash identifica o conteúdo enviado junto da chave.
         var requestHash = Convert.ToHexString(
-            System.Security.Cryptography.SHA256.HashData(
-                System.Text.Encoding.UTF8.GetBytes(
+            SHA256.HashData(
+                Encoding.UTF8.GetBytes(
                     $"{destinationAccountNumber}|{request.Amount.ToString(
-                        System.Globalization.CultureInfo.InvariantCulture)}")));
+                        CultureInfo.InvariantCulture)}")));
 
-        // 5. Iniciar transação
+        // 5. Retry de concorrência.
+        //
+        // Cada tentativa utiliza uma nova transação e limpa o
+        // ChangeTracker após conflito. Isso é importante porque,
+        // depois de uma DbUpdateConcurrencyException, as entidades
+        // rastreadas pelo DbContext podem conter valores antigos.
+        for (var attempt = 1;
+             attempt <= MaxConcurrencyRetries;
+             attempt++)
+        {
+            try
+            {
+                var result =
+                    await ExecuteTransferAttemptAsync(
+                        sourceAccountId,
+                        request,
+                        destinationAccountNumber,
+                        requestHash,
+                        idempotencyKey);
+
+                return result;
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                _db.ChangeTracker.Clear();
+
+                if (attempt == MaxConcurrencyRetries)
+                {
+                    throw new BusinessException(
+                        "CONCURRENT_MODIFICATION",
+                        "The transfer could not be completed because the account was modified concurrently. Please retry.",
+                        409);
+                }
+
+                // Pequeno atraso progressivo para evitar que várias
+                // requisições concorrentes entrem novamente juntas.
+                var delayMilliseconds =
+                    Math.Min(25 * attempt, 250);
+
+                await Task.Delay(delayMilliseconds);
+            }
+            catch (DbUpdateException ex)
+                when (IsUniqueConstraintViolation(ex))
+            {
+                /*
+                 * Duas requisições podem chegar simultaneamente com
+                 * a mesma Idempotency-Key.
+                 *
+                 * Ambas podem inicialmente não encontrar o registro.
+                 * Uma delas grava primeiro e a outra recebe violação
+                 * da constraint UNIQUE.
+                 *
+                 * Neste caso, devemos consultar o registro que acabou
+                 * de ser criado e retornar exatamente a mesma resposta.
+                 */
+                _db.ChangeTracker.Clear();
+
+                var existingRequest =
+                    await _db.IdempotencyRequests
+                        .AsNoTracking()
+                        .FirstOrDefaultAsync(x =>
+                            x.AccountId == sourceAccountId &&
+                            x.Key == idempotencyKey);
+
+                if (existingRequest is null)
+                {
+                    throw;
+                }
+
+                if (existingRequest.RequestHash != requestHash)
+                {
+                    throw new BusinessException(
+                        "IDEMPOTENCY_KEY_REUSED",
+                        "The Idempotency-Key was already used with a different request.",
+                        409);
+                }
+
+                var previousResponse =
+                    JsonSerializer.Deserialize<TransferResponse>(
+                        existingRequest.ResponseBody);
+
+                if (previousResponse is null)
+                {
+                    throw new BusinessException(
+                        "IDEMPOTENCY_RESPONSE_INVALID",
+                        "The stored idempotency response is invalid.",
+                        500);
+                }
+
+                return previousResponse;
+            }
+        }
+
+        // Tecnicamente inalcançável.
+        throw new BusinessException(
+            "CONCURRENT_MODIFICATION",
+            "The transfer could not be completed because the account was modified concurrently.",
+            409);
+    }
+
+    private async Task<TransferResponse> ExecuteTransferAttemptAsync(
+        Guid sourceAccountId,
+        TransferRequest request,
+        string destinationAccountNumber,
+        string requestHash,
+        string idempotencyKey)
+    {
         await using var transaction =
             await _db.Database.BeginTransactionAsync();
 
-        // 6. Verificar idempotência
+        // ============================================================
+        // 1. IDEMPOTÊNCIA
+        // ============================================================
+
         var existingRequest =
             await _db.IdempotencyRequests
+                .AsNoTracking()
                 .FirstOrDefaultAsync(x =>
                     x.AccountId == sourceAccountId &&
                     x.Key == idempotencyKey);
@@ -74,8 +193,6 @@ public class TransferService
         {
             if (existingRequest.RequestHash != requestHash)
             {
-                await transaction.RollbackAsync();
-
                 throw new BusinessException(
                     "IDEMPOTENCY_KEY_REUSED",
                     "The Idempotency-Key was already used with a different request.",
@@ -88,144 +205,186 @@ public class TransferService
 
             if (previousResponse is null)
             {
-                await transaction.RollbackAsync();
-
                 throw new BusinessException(
                     "IDEMPOTENCY_RESPONSE_INVALID",
                     "The stored idempotency response is invalid.",
                     500);
             }
 
-            await transaction.RollbackAsync();
-
             return previousResponse;
         }
 
-        // 7. Buscar conta origem
-        var sourceAccount = await _db.Accounts
-            .FirstOrDefaultAsync(x =>
-                x.Id == sourceAccountId);
+        // ============================================================
+        // 2. BUSCAR CONTA DE ORIGEM
+        // ============================================================
+
+        var sourceAccount =
+            await _db.Accounts
+                .FirstOrDefaultAsync(x =>
+                    x.Id == sourceAccountId);
 
         if (sourceAccount is null)
         {
-            await transaction.RollbackAsync();
-
             throw new BusinessException(
                 "SOURCE_ACCOUNT_NOT_FOUND",
                 "The source account was not found.",
                 404);
         }
 
-        // 8. Buscar conta destino
-        var destinationAccount = await _db.Accounts
-            .FirstOrDefaultAsync(x =>
-                x.AccountNumber == destinationAccountNumber);
+        // ============================================================
+        // 3. BUSCAR CONTA DE DESTINO
+        // ============================================================
+
+        var destinationAccount =
+            await _db.Accounts
+                .FirstOrDefaultAsync(x =>
+                    x.AccountNumber == destinationAccountNumber);
 
         if (destinationAccount is null)
         {
-            await transaction.RollbackAsync();
-
             throw new BusinessException(
                 "DESTINATION_ACCOUNT_NOT_FOUND",
                 "The destination account was not found.",
                 404);
         }
 
-        // 9. Não permitir transferência para a própria conta
+        // ============================================================
+        // 4. VALIDAR TRANSFERÊNCIA PARA A PRÓPRIA CONTA
+        // ============================================================
+
         if (sourceAccount.Id == destinationAccount.Id)
         {
-            await transaction.RollbackAsync();
-
             throw new BusinessException(
                 "SELF_TRANSFER_NOT_ALLOWED",
                 "Transfers to the same account are not allowed.",
                 400);
         }
 
-        // 10. Verificar saldo
+        // ============================================================
+        // 5. VALIDAR SALDO
+        // ============================================================
+
         if (sourceAccount.Balance < request.Amount)
         {
-            await transaction.RollbackAsync();
-
             throw new BusinessException(
                 "INSUFFICIENT_FUNDS",
                 "Insufficient funds.",
                 422);
         }
 
-        // 11. Débito da conta origem
-        sourceAccount.Balance -= request.Amount;
+        // ============================================================
+        // 6. ATUALIZAR SALDOS
+        // ============================================================
 
-        // 12. Crédito da conta destino
+        sourceAccount.Balance -= request.Amount;
         destinationAccount.Balance += request.Amount;
 
-        // 13. Atualizar versão para controle de concorrência
+        // O campo Version é utilizado pelo EF Core como token
+        // de concorrência.
+        //
+        // Se outra transação modificar a mesma conta entre o SELECT
+        // e o UPDATE, o UPDATE afetará zero linhas e o EF lançará
+        // DbUpdateConcurrencyException.
         sourceAccount.Version++;
         destinationAccount.Version++;
 
-        // 14. Criar transferência
+        var transferCreatedAt =
+            DateTime.UtcNow;
+
+        // ============================================================
+        // 7. CRIAR TRANSFERÊNCIA
+        // ============================================================
+
         var transfer = new Transfer
         {
             Id = Guid.NewGuid(),
 
-            SourceAccountId = sourceAccount.Id,
+            SourceAccountId =
+                sourceAccount.Id,
 
-            DestinationAccountId = destinationAccount.Id,
+            DestinationAccountId =
+                destinationAccount.Id,
 
-            Amount = request.Amount,
+            Amount =
+                request.Amount,
 
-            Status = TransferStatus.Completed,
+            Status =
+                TransferStatus.Completed,
 
-            CreatedAt = DateTime.UtcNow
+            CreatedAt =
+                transferCreatedAt
         };
 
         _db.Transfers.Add(transfer);
 
-        // 15. Criar Ledger da conta origem
+        // ============================================================
+        // 8. LEDGER - DÉBITO
+        // ============================================================
+
         var debitLedger = new LedgerEntry
         {
             Id = Guid.NewGuid(),
 
-            AccountId = sourceAccount.Id,
+            AccountId =
+                sourceAccount.Id,
 
-            Amount = -request.Amount,
+            Amount =
+                -request.Amount,
 
-            BalanceAfter = sourceAccount.Balance,
+            BalanceAfter =
+                sourceAccount.Balance,
 
-            Type = "TRANSFER_DEBIT",
+            Type =
+                "TRANSFER_DEBIT",
 
-            TransferId = transfer.Id,
+            TransferId =
+                transfer.Id,
 
-            CreatedAtUtc = DateTime.UtcNow
+            CreatedAtUtc =
+                transferCreatedAt
         };
 
-        // 16. Criar Ledger da conta destino
+        // ============================================================
+        // 9. LEDGER - CRÉDITO
+        // ============================================================
+
         var creditLedger = new LedgerEntry
         {
             Id = Guid.NewGuid(),
 
-            AccountId = destinationAccount.Id,
+            AccountId =
+                destinationAccount.Id,
 
-            Amount = request.Amount,
+            Amount =
+                request.Amount,
 
-            BalanceAfter = destinationAccount.Balance,
+            BalanceAfter =
+                destinationAccount.Balance,
 
-            Type = "TRANSFER_CREDIT",
+            Type =
+                "TRANSFER_CREDIT",
 
-            TransferId = transfer.Id,
+            TransferId =
+                transfer.Id,
 
-            CreatedAtUtc = DateTime.UtcNow
+            CreatedAtUtc =
+                transferCreatedAt
         };
 
         _db.LedgerEntries.Add(debitLedger);
         _db.LedgerEntries.Add(creditLedger);
 
-        // 17. Criar resposta
+        // ============================================================
+        // 10. RESPOSTA
+        // ============================================================
+
         var response = new TransferResponse
         {
-            TransferId = transfer.Id,
+            TransferId =
+                transfer.Id,
 
-            SourceAccountId = sourceAccount.Id,
+            SourceAccountId =
+                sourceAccount.Id,
 
             SourceAccountNumber =
                 sourceAccount.AccountNumber,
@@ -236,63 +395,65 @@ public class TransferService
             DestinationAccountNumber =
                 destinationAccount.AccountNumber,
 
-            Amount = request.Amount,
+            Amount =
+                request.Amount,
 
-            SourceBalance = sourceAccount.Balance,
+            SourceBalance =
+                sourceAccount.Balance,
 
-            Status = transfer.Status.ToString(),
+            Status =
+                transfer.Status.ToString(),
 
-            CreatedAt = transfer.CreatedAt
+            CreatedAt =
+                transfer.CreatedAt
         };
 
-        // 18. Registrar idempotência
+        // ============================================================
+        // 11. REGISTRO DE IDEMPOTÊNCIA
+        // ============================================================
+
         var idempotencyRequest = new IdempotencyRequest
         {
-            Id = Guid.NewGuid(),
+            Id =
+                Guid.NewGuid(),
 
-            Key = idempotencyKey,
+            Key =
+                idempotencyKey,
 
-            AccountId = sourceAccount.Id,
+            AccountId =
+                sourceAccount.Id,
 
-            RequestHash = requestHash,
+            RequestHash =
+                requestHash,
 
-            ResponseStatusCode = 200,
+            ResponseStatusCode =
+                200,
 
             ResponseBody =
                 JsonSerializer.Serialize(response),
 
-            CreatedAt = DateTime.UtcNow
+            CreatedAt =
+                DateTime.UtcNow
         };
 
         _db.IdempotencyRequests.Add(
             idempotencyRequest);
 
-        // 19. Persistir tudo com controle de concorrência
-        try
-        {
-            await _db.SaveChangesAsync();
+        // ============================================================
+        // 12. PERSISTÊNCIA ATÔMICA
+        // ============================================================
 
-            // 20. Confirmar transação
-            await transaction.CommitAsync();
-        }
-        catch (DbUpdateConcurrencyException)
-        {
-            try
-            {
-                await transaction.RollbackAsync();
-            }
-            catch
-            {
-                // A transação pode já ter sido
-                // revertida pelo banco de dados.
-            }
+        await _db.SaveChangesAsync();
 
-            // Deixa o ConcurrencyExceptionHandler
-            // tratar a exceção e retornar HTTP 409.
-            throw;
-        }
+        await transaction.CommitAsync();
 
-        // 21. Retornar resposta
         return response;
+    }
+
+    private static bool IsUniqueConstraintViolation(
+        DbUpdateException exception)
+    {
+        return exception.InnerException is PostgresException postgresException
+            && postgresException.SqlState == PostgresErrorCodes.UniqueViolation;
     }
 }
